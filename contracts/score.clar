@@ -1,167 +1,126 @@
-;; Title: ScoreDAO - DAO Contribution Tracking System
-;; File: dao-tracker.clar
+;; DAO Contract
+;; Constants for configuration
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-ALREADY-MEMBER (err u101))
+(define-constant ERR-NOT-MEMBER (err u102))
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u103))
+(define-constant ERR-ALREADY-VOTED (err u104))
+(define-constant ERR-PROPOSAL-EXPIRED (err u105))
+(define-constant ERR-ALREADY-EXECUTED (err u106))
+(define-constant ERR-NOT-ENOUGH-VOTES (err u107))
+(define-constant ERR-PROPOSAL-REJECTED (err u108))
+(define-constant VOTING_PERIOD u144) ;; ~24 hours in blocks
+(define-constant MINIMUM_VOTES u3)
 
-;; Constants and Error Codes
-(define-constant contract-owner tx-sender)
-(define-constant err-owner-only (err u100))
-(define-constant err-not-found (err u101))
-(define-constant err-unauthorized (err u102))
-(define-constant err-invalid-score (err u103))
-
-;; Define reputation token
-(define-fungible-token dao-rep)
-
-;; Data Structures
-(define-map contributors
-    { address: principal }
+;; Data maps for storing DAO state
+(define-map members principal bool)
+(define-map proposals
+    uint
     {
-        reputation-score: uint,
-        total-contributions: uint,
-        last-contribution: uint,
-        level: uint
+        proposer: principal,
+        title: (string-ascii 50),
+        description: (string-utf8 500),
+        yes-votes: uint,
+        no-votes: uint,
+        start-block: uint,
+        executed: bool
     }
 )
+(define-map votes {proposal-id: uint, voter: principal} bool)
 
-(define-map contribution-types
-    { type-id: uint }
-    {
-        name: (string-ascii 50),
-        weight: uint,
-        min-proof-required: uint
-    }
+;; Data variables
+(define-data-var proposal-count uint u0)
+(define-data-var admin principal tx-sender)
+
+;; Read-only functions
+(define-read-only (is-member (user principal))
+    (default-to false (map-get? members user))
 )
 
-(define-map contributions
-    { contribution-id: uint }
-    {
-        contributor: principal,
-        type-id: uint,
-        timestamp: uint,
-        proof: (string-ascii 256),
-        verified: bool,
-        score: uint
-    }
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? proposals proposal-id)
 )
 
-;; Counters
-(define-data-var contribution-counter uint u0)
-(define-data-var type-counter uint u0)
+(define-read-only (has-voted (proposal-id uint) (user principal))
+    (default-to false (map-get? votes {proposal-id: proposal-id, voter: user}))
+)
 
-;; Administrative Functions
+;; Public functions
+(define-public (add-member (new-member principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-member new-member)) ERR-ALREADY-MEMBER)
+        (ok (map-set members new-member true))
+    )
+)
 
-(define-public (add-contribution-type 
-    (name (string-ascii 50))
-    (weight uint)
-    (min-proof-required uint))
-    (let ((type-id (var-get type-counter)))
-        (if (is-eq tx-sender contract-owner)
-            (begin
-                (map-set contribution-types
-                    { type-id: type-id }
-                    {
-                        name: name,
-                        weight: weight,
-                        min-proof-required: min-proof-required
-                    })
-                (var-set type-counter (+ type-id u1))
-                (ok type-id))
-            err-owner-only)))
+(define-public (remove-member (member principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-member member) ERR-NOT-MEMBER)
+        (ok (map-delete members member))
+    )
+)
 
-;; Contribution Recording Functions
-
-(define-public (submit-contribution 
-    (type-id uint)
-    (proof (string-ascii 256)))
-    (let ((contribution-id (var-get contribution-counter)))
-        (match (map-get? contribution-types { type-id: type-id })
-            contribution-type
-            (begin
-                (map-set contributions
-                    { contribution-id: contribution-id }
-                    {
-                        contributor: tx-sender,
-                        type-id: type-id,
-                        timestamp: block-height,
-                        proof: proof,
-                        verified: false,
-                        score: u0
-                    })
-                (var-set contribution-counter (+ contribution-id u1))
-                (ok contribution-id))
-            err-not-found)))
-
-;; Verification and Scoring
-
-(define-public (verify-contribution 
-    (contribution-id uint)
-    (verified-score uint))
-    (if (is-eq tx-sender contract-owner)
-        (match (map-get? contributions { contribution-id: contribution-id })
-            contribution
-            (begin
-                (try! (update-contributor-score (get contributor contribution) verified-score))
-                (map-set contributions
-                    { contribution-id: contribution-id }
-                    (merge contribution 
-                        { 
-                            verified: true,
-                            score: verified-score
-                        }))
-                (ok true))
-            err-not-found)
-        err-owner-only))
-
-(define-private (update-contributor-score (contributor principal) (score uint))
-    (match (map-get? contributors { address: contributor })
-        existing-data
+(define-public (create-proposal (title (string-ascii 50)) (description (string-utf8 500)))
+    (let
+        ((proposal-id (var-get proposal-count)))
         (begin
-            (map-set contributors
-                { address: contributor }
+            (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            (map-set proposals proposal-id
                 {
-                    reputation-score: (+ (get reputation-score existing-data) score),
-                    total-contributions: (+ (get total-contributions existing-data) u1),
-                    last-contribution: block-height,
-                    level: (calculate-level (+ (get reputation-score existing-data) score))
-                })
-            (try! (ft-mint? dao-rep score contributor))
-            (ok true))
+                    proposer: tx-sender,
+                    title: title,
+                    description: description,
+                    yes-votes: u0,
+                    no-votes: u0,
+                    start-block: block-height,
+                    executed: false
+                }
+            )
+            (var-set proposal-count (+ proposal-id u1))
+            (ok proposal-id)
+        )
+    )
+)
+
+(define-public (vote (proposal-id uint) (vote-for bool))
+    (let
+        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
         (begin
-            (map-set contributors
-                { address: contributor }
-                {
-                    reputation-score: score,
-                    total-contributions: u1,
-                    last-contribution: block-height,
-                    level: (calculate-level score)
-                })
-            (try! (ft-mint? dao-rep score contributor))
-            (ok true))))
+            (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (has-voted proposal-id tx-sender)) ERR-ALREADY-VOTED)
+            (asserts! (< (- block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
+            
+            (map-set votes {proposal-id: proposal-id, voter: tx-sender} true)
+            
+            (if vote-for
+                (map-set proposals proposal-id 
+                    (merge proposal {yes-votes: (+ (get yes-votes proposal) u1)}))
+                (map-set proposals proposal-id 
+                    (merge proposal {no-votes: (+ (get no-votes proposal) u1)}))
+            )
+            (ok true)
+        )
+    )
+)
 
-;; Helper Functions
-
-(define-private (calculate-level (score uint))
-    (if (< score u100)
-        u1
-        (if (< score u500)
-            u2
-            (if (< score u1000)
-                u3
-                u4))))
-
-;; Read-only Functions
-
-(define-read-only (get-contributor-info (address principal))
-    (map-get? contributors { address: address }))
-
-(define-read-only (get-contribution (contribution-id uint))
-    (map-get? contributions { contribution-id: contribution-id }))
-
-(define-read-only (get-contribution-type (type-id uint))
-    (map-get? contribution-types { type-id: type-id }))
-
-(define-read-only (get-reputation-balance (address principal))
-    (ft-get-balance dao-rep address))
-
-;; Initialize contract
-(begin
-    (try! (ft-mint? dao-rep u0 contract-owner)))
+(define-public (execute-proposal (proposal-id uint))
+    (let
+        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (begin
+            (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (>= (- block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
+            (asserts! (not (get executed proposal)) ERR-ALREADY-EXECUTED)
+            (asserts! (>= (+ (get yes-votes proposal) (get no-votes proposal)) MINIMUM_VOTES) ERR-NOT-ENOUGH-VOTES)
+            
+            (if (> (get yes-votes proposal) (get no-votes proposal))
+                (begin
+                    (map-set proposals proposal-id (merge proposal {executed: true}))
+                    (ok true)
+                )
+                ERR-PROPOSAL-REJECTED
+            )
+        )
+    )
+)
