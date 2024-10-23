@@ -9,8 +9,14 @@
 (define-constant ERR-ALREADY-EXECUTED (err u106))
 (define-constant ERR-NOT-ENOUGH-VOTES (err u107))
 (define-constant ERR-PROPOSAL-REJECTED (err u108))
+(define-constant ERR-INVALID-TITLE (err u109))
+(define-constant ERR-INVALID-DESCRIPTION (err u110))
 (define-constant VOTING_PERIOD u144) ;; ~24 hours in blocks
 (define-constant MINIMUM_VOTES u3)
+(define-constant MIN_TITLE_LENGTH u4)
+(define-constant MAX_TITLE_LENGTH u50)
+(define-constant MIN_DESCRIPTION_LENGTH u10)
+(define-constant MAX_DESCRIPTION_LENGTH u500)
 
 ;; Data maps for storing DAO state
 (define-map members principal bool)
@@ -45,6 +51,33 @@
     (default-to false (map-get? votes {proposal-id: proposal-id, voter: user}))
 )
 
+;; Validation functions
+(define-private (is-valid-title (title (string-ascii 50)))
+    (let
+        (
+            (length (len title))
+        )
+        (and
+            (>= length MIN_TITLE_LENGTH)
+            (<= length MAX_TITLE_LENGTH)
+            (not (is-eq title ""))
+        )
+    )
+)
+
+(define-private (is-valid-description (description (string-utf8 500)))
+    (let
+        (
+            (length (len description))
+        )
+        (and
+            (>= length MIN_DESCRIPTION_LENGTH)
+            (<= length MAX_DESCRIPTION_LENGTH)
+            (not (is-eq description u""))
+        )
+    )
+)
+
 ;; Public functions
 (define-public (add-member (new-member principal))
     (begin
@@ -67,6 +100,10 @@
         ((proposal-id (var-get proposal-count)))
         (begin
             (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            ;; Validate input data
+            (asserts! (is-valid-title title) ERR-INVALID-TITLE)
+            (asserts! (is-valid-description description) ERR-INVALID-DESCRIPTION)
+            
             (map-set proposals proposal-id
                 {
                     proposer: tx-sender,
