@@ -15,6 +15,8 @@
 (define-constant ERR-INVALID-DESCRIPTION (err u110))
 (define-constant ERR-QUORUM-NOT-REACHED (err u111))
 (define-constant ERR-SUPERMAJORITY-NOT-REACHED (err u112))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u113))
+(define-constant ERR-INVALID-DELEGATE (err u114))
 
 ;; Governance parameters
 (define-constant VOTING_PERIOD u144) ;; ~24 hours in blocks
@@ -32,6 +34,9 @@
 ;; Data maps for storing DAO state
 (define-map members principal bool)
 (define-data-var member-count uint u0)
+
+;; New delegation map
+(define-map delegations principal principal)
 
 (define-map proposals
     uint
@@ -68,6 +73,11 @@
 
 (define-read-only (get-total-members)
     (var-get member-count)
+)
+
+;; New delegation read functions
+(define-read-only (get-delegate (member principal))
+    (map-get? delegations member)
 )
 
 ;; Private helper functions
@@ -126,7 +136,26 @@
         (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
         (asserts! (is-member member) ERR-NOT-MEMBER)
         (var-set member-count (- (var-get member-count) u1))
+        (map-delete delegations member)
         (ok (map-delete members member))
+    )
+)
+
+;; New delegation function
+(define-public (delegate-vote (delegate-to principal))
+    (begin
+        (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-member delegate-to) ERR-NOT-MEMBER)
+        (asserts! (not (is-eq tx-sender delegate-to)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (ok (map-set delegations tx-sender delegate-to))
+    )
+)
+
+;; New function to remove delegation
+(define-public (remove-delegation)
+    (begin
+        (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+        (ok (map-delete delegations tx-sender))
     )
 )
 
@@ -164,13 +193,44 @@
 
 (define-public (vote (proposal-id uint) (vote-for bool))
     (let
-        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+         (delegate-check (get-delegate tx-sender)))
         (begin
             (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            ;; Check if the voter hasn't delegated their vote
+            (asserts! (is-none delegate-check) ERR-NOT-AUTHORIZED)
             (asserts! (not (has-voted proposal-id tx-sender)) ERR-ALREADY-VOTED)
             (asserts! (< (- block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
             
             (map-set votes {proposal-id: proposal-id, voter: tx-sender} true)
+            
+            (if vote-for
+                (map-set proposals proposal-id 
+                    (merge proposal {yes-votes: (+ (get yes-votes proposal) u1)}))
+                (map-set proposals proposal-id 
+                    (merge proposal {no-votes: (+ (get no-votes proposal) u1)}))
+            )
+            (ok true)
+        )
+    )
+)
+
+;; New function for delegated voting
+(define-public (vote-for-delegator (delegator principal) (proposal-id uint) (vote-for bool))
+    (let
+        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+         (delegate-check (get-delegate delegator)))
+        (begin
+            (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (is-member delegator) ERR-NOT-MEMBER)
+            ;; Check if the delegator has delegated to the sender
+            (asserts! (and (is-some delegate-check) 
+                          (is-eq (some tx-sender) delegate-check)) 
+                     ERR-NOT-AUTHORIZED)
+            (asserts! (not (has-voted proposal-id delegator)) ERR-ALREADY-VOTED)
+            (asserts! (< (- block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
+            
+            (map-set votes {proposal-id: proposal-id, voter: delegator} true)
             
             (if vote-for
                 (map-set proposals proposal-id 
