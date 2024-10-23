@@ -1,4 +1,6 @@
-;; DAO Contract
+;; ScoreDAO Contract
+;; A DAO for decentralized scoring and governance
+
 ;; Constants for configuration
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-ALREADY-MEMBER (err u101))
@@ -11,27 +13,40 @@
 (define-constant ERR-PROPOSAL-REJECTED (err u108))
 (define-constant ERR-INVALID-TITLE (err u109))
 (define-constant ERR-INVALID-DESCRIPTION (err u110))
+(define-constant ERR-QUORUM-NOT-REACHED (err u111))
+(define-constant ERR-SUPERMAJORITY-NOT-REACHED (err u112))
+
+;; Governance parameters
 (define-constant VOTING_PERIOD u144) ;; ~24 hours in blocks
-(define-constant MINIMUM_VOTES u3)
 (define-constant MIN_TITLE_LENGTH u4)
 (define-constant MAX_TITLE_LENGTH u50)
 (define-constant MIN_DESCRIPTION_LENGTH u10)
 (define-constant MAX_DESCRIPTION_LENGTH u500)
+(define-constant QUORUM_PERCENTAGE u30) ;; 30% of total members must vote
+(define-constant SUPERMAJORITY_PERCENTAGE u67) ;; 67% yes votes needed for critical proposals
+
+;; Proposal types
+(define-constant PROPOSAL-TYPE-STANDARD u1)
+(define-constant PROPOSAL-TYPE-CRITICAL u2) ;; Requires supermajority
 
 ;; Data maps for storing DAO state
 (define-map members principal bool)
+(define-data-var member-count uint u0)
+
 (define-map proposals
     uint
     {
         proposer: principal,
         title: (string-ascii 50),
         description: (string-utf8 500),
+        proposal-type: uint,
         yes-votes: uint,
         no-votes: uint,
         start-block: uint,
         executed: bool
     }
 )
+
 (define-map votes {proposal-id: uint, voter: principal} bool)
 
 ;; Data variables
@@ -51,12 +66,14 @@
     (default-to false (map-get? votes {proposal-id: proposal-id, voter: user}))
 )
 
-;; Validation functions
+(define-read-only (get-total-members)
+    (var-get member-count)
+)
+
+;; Private helper functions
 (define-private (is-valid-title (title (string-ascii 50)))
     (let
-        (
-            (length (len title))
-        )
+        ((length (len title)))
         (and
             (>= length MIN_TITLE_LENGTH)
             (<= length MAX_TITLE_LENGTH)
@@ -67,9 +84,7 @@
 
 (define-private (is-valid-description (description (string-utf8 500)))
     (let
-        (
-            (length (len description))
-        )
+        ((length (len description)))
         (and
             (>= length MIN_DESCRIPTION_LENGTH)
             (<= length MAX_DESCRIPTION_LENGTH)
@@ -78,11 +93,30 @@
     )
 )
 
+(define-private (calculate-vote-percentage (yes-votes uint) (total-votes uint))
+    (if (is-eq total-votes u0)
+        u0
+        (/ (* yes-votes u100) total-votes)
+    )
+)
+
+(define-private (has-reached-quorum (total-votes uint))
+    (let
+        ((required-votes (/ (* (var-get member-count) QUORUM_PERCENTAGE) u100)))
+        (>= total-votes required-votes)
+    )
+)
+
+(define-private (has-reached-supermajority (yes-votes uint) (total-votes uint))
+    (>= (calculate-vote-percentage yes-votes total-votes) SUPERMAJORITY_PERCENTAGE)
+)
+
 ;; Public functions
 (define-public (add-member (new-member principal))
     (begin
         (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
         (asserts! (not (is-member new-member)) ERR-ALREADY-MEMBER)
+        (var-set member-count (+ (var-get member-count) u1))
         (ok (map-set members new-member true))
     )
 )
@@ -91,24 +125,31 @@
     (begin
         (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
         (asserts! (is-member member) ERR-NOT-MEMBER)
+        (var-set member-count (- (var-get member-count) u1))
         (ok (map-delete members member))
     )
 )
 
-(define-public (create-proposal (title (string-ascii 50)) (description (string-utf8 500)))
+(define-public (create-proposal 
+    (title (string-ascii 50)) 
+    (description (string-utf8 500))
+    (proposal-type uint)
+)
     (let
         ((proposal-id (var-get proposal-count)))
         (begin
             (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
-            ;; Validate input data
             (asserts! (is-valid-title title) ERR-INVALID-TITLE)
             (asserts! (is-valid-description description) ERR-INVALID-DESCRIPTION)
+            (asserts! (or (is-eq proposal-type PROPOSAL-TYPE-STANDARD)
+                         (is-eq proposal-type PROPOSAL-TYPE-CRITICAL)) ERR-NOT-AUTHORIZED)
             
             (map-set proposals proposal-id
                 {
                     proposer: tx-sender,
                     title: title,
                     description: description,
+                    proposal-type: proposal-type,
                     yes-votes: u0,
                     no-votes: u0,
                     start-block: block-height,
@@ -144,13 +185,24 @@
 
 (define-public (execute-proposal (proposal-id uint))
     (let
-        ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+        )
         (begin
             (asserts! (is-member tx-sender) ERR-NOT-AUTHORIZED)
             (asserts! (>= (- block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
             (asserts! (not (get executed proposal)) ERR-ALREADY-EXECUTED)
-            (asserts! (>= (+ (get yes-votes proposal) (get no-votes proposal)) MINIMUM_VOTES) ERR-NOT-ENOUGH-VOTES)
+            (asserts! (has-reached-quorum total-votes) ERR-QUORUM-NOT-REACHED)
             
+            ;; Check if supermajority is required
+            (if (is-eq (get proposal-type proposal) PROPOSAL-TYPE-CRITICAL)
+                (asserts! (has-reached-supermajority (get yes-votes proposal) total-votes)
+                         ERR-SUPERMAJORITY-NOT-REACHED)
+                true
+            )
+            
+            ;; For standard proposals, simple majority is enough
             (if (> (get yes-votes proposal) (get no-votes proposal))
                 (begin
                     (map-set proposals proposal-id (merge proposal {executed: true}))
